@@ -1,0 +1,96 @@
+// A neural bigram model of names (makemore, part 1): one character in,
+// a distribution over the next one out, learned as a (vocab × vocab)
+// table of scores. Run from the repository root:
+//     lughac run example/bigram.la
+import firefly.graph;
+import firefly.nn;
+import firefly.random;
+import firefly.text;
+import std.math;
+
+fun main() {
+    let raw = match read_file("data/names.txt") {
+        Ok(t) => t,
+        Err(e) => panic("can't read data/names.txt ({e}): run from the repository root"),
+    };
+    let names = raw.lines().filter(fun(l: string): bool = l.len > 0);
+    let vocab = text.from_lines(names);
+    let v = vocab.size();
+
+    // Every (character, next character) pair, with `.` around each name.
+    let mut xs: i64[] = [];
+    let mut ys: i64[] = [];
+    for name of names {
+        let mut prev = 0;
+        for c of name.chars() {
+            let id = vocab.encode(c);
+            xs.push(prev);
+            ys.push(id);
+            prev = id;
+        }
+        xs.push(prev);
+        ys.push(0);
+    }
+    println("{names.len} names, {xs.len} bigrams, {v} tokens");
+
+    // The best a bigram model can do on this data: count the pairs and
+    // score the data with those frequencies. Adding one to every count
+    // (smoothing, so unseen pairs aren't impossible) costs some loss on
+    // the training data in exchange for generalising.
+    println("counting model loss: {count_loss(xs, ys, v, 0.0):.4} (exact optimum), {count_loss(xs, ys, v, 1.0):.4} (with +1 smoothing)");
+
+    // The neural version: logits = W[x], trained by gradient descent
+    // towards the exact optimum.
+    let mut rng = random.seeded(2147483647);
+    let mut g = graph.new();
+    let w = g.param(rng.normals([v, v], 1.0));
+    for step in 0..301 {
+        g.reset();
+        let logits = g.rows(w, xs);
+        let loss = g.cross_entropy(logits, ys);
+        g.backward(loss);
+        g.sgd(50.0);
+        if step % 50 == 0 {
+            println("step {step:>3}  loss {g.value(loss).data[0]:.4}");
+        }
+    }
+
+    // Sampling: start at `.`, draw the next character from softmax(W[x]),
+    // stop at the next `.`.
+    let table = g.value(w);
+    println("samples:");
+    for i in 0..10 {
+        let mut name = "";
+        let mut x = 0;
+        while true {
+            let mut scores: f64[] = [];
+            for j in 0..v {
+                scores.push(table.data[x * v + j]);
+            }
+            x = rng.pick(nn.softmax(scores));
+            if x == 0 {
+                break;
+            }
+            name = "{name}{vocab.decode(x)}";
+        }
+        println("  {name}");
+    }
+}
+
+// The mean negative log-likelihood of the pairs (xs[k], ys[k]) under
+// bigram frequencies counted from them, each count plus `smoothing`.
+fun count_loss(xs: i64[], ys: i64[], v: i64, smoothing: f64): f64 {
+    let mut counts = [smoothing; v * v];
+    for k in 0..xs.len {
+        counts[xs[k] * v + ys[k]] += 1.0;
+    }
+    let mut nll = 0.0;
+    for k in 0..xs.len {
+        let mut row = 0.0;
+        for j in 0..v {
+            row += counts[xs[k] * v + j];
+        }
+        nll -= math.ln(counts[xs[k] * v + ys[k]] / row);
+    }
+    nll / xs.len as f64
+}

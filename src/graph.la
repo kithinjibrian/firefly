@@ -13,6 +13,10 @@
 //     let loss = g.mean(y);
 //     g.backward(loss);
 //     g.sgd(0.1);
+//
+// Ops: add, sub, mul (element-wise), matmul, add_row (bias), tanh, relu,
+// sigmoid, sum, mean, rows (embedding lookup), cross_entropy (softmax +
+// negative log-likelihood).
 import glowworm.array;
 import glowworm.linalg;
 import std.math;
@@ -30,6 +34,8 @@ enum Op {
     Sigmoid(i64),
     Sum(i64),
     Mean(i64),
+    Rows(i64, i64[]),
+    CrossEntropy(i64, i64[]),
 }
 
 public struct Graph {
@@ -157,6 +163,49 @@ impl Graph {
         self.push(v, Op.Mean(a))
     }
 
+    // Rows `ids` of a (vocab × dim) table, as an (ids.len × dim) matrix:
+    // an embedding lookup, the same as one-hot rows times the table.
+    public fun rows(mut self, table: i64, ids: i64[]): i64 {
+        let t = self.values[table];
+        if t.shape.len != 2 {
+            panic("rows needs a 2-D table, not shape {t.shape}");
+        }
+        let (vocab, dim) = (t.shape[0], t.shape[1]);
+        let mut data: f64[] = [];
+        for id of ids {
+            if id < 0 || id >= vocab {
+                panic("row {id} is outside a table of {vocab} rows");
+            }
+            for c in 0..dim {
+                data.push(t.data[id * dim + c]);
+            }
+        }
+        self.push(array.from([ids.len, dim], data), Op.Rows(table, ids))
+    }
+
+    // The mean negative log-likelihood of `targets` under softmax(`logits`)
+    // row by row: (n × classes) logits, n target classes. Computed through
+    // the log-sum-exp with each row's maximum taken out, so large logits
+    // can't overflow.
+    public fun cross_entropy(mut self, logits: i64, targets: i64[]): i64 {
+        let l = self.values[logits];
+        if l.shape.len != 2 || l.shape[0] != targets.len {
+            panic("cross_entropy needs (n × classes) logits and n targets, not {l.shape} and {targets.len}");
+        }
+        let classes = l.shape[1];
+        let mut total = 0.0;
+        for i in 0..targets.len {
+            let row = i * classes;
+            let target = targets[i];
+            if target < 0 || target >= classes {
+                panic("target {target} is outside {classes} classes");
+            }
+            total += log_sum_exp(l.data, row, classes) - l.data[row + target];
+        }
+        let v = array.from([1], [total / targets.len as f64]);
+        self.push(v, Op.CrossEntropy(logits, targets))
+    }
+
     // ---- Learning ------------------------------------------------------
 
     // Fills every gradient with d`loss`/d(tensor), `loss` being a
@@ -228,6 +277,32 @@ impl Graph {
                 let shape = self.values[a].shape;
                 self.accumulate(a, array.full(shape, g.data[0]));
             }
+            Rows(table, ids) => {
+                let dim = g.shape[1];
+                let mut back: array.NdArray<f64> = array.zeros(self.values[table].shape);
+                for k in 0..ids.len {
+                    for c in 0..dim {
+                        back.data[ids[k] * dim + c] += g.data[k * dim + c];
+                    }
+                }
+                self.accumulate(table, back);
+            }
+            CrossEntropy(logits, targets) => {
+                // d(loss)/d(logit) = (softmax - one-hot) / n, row by row.
+                let l = self.values[logits];
+                let (n, classes) = (l.shape[0], l.shape[1]);
+                let scale = g.data[0] / n as f64;
+                let mut back: array.NdArray<f64> = array.zeros(l.shape);
+                for i in 0..n {
+                    let row = i * classes;
+                    let lse = log_sum_exp(l.data, row, classes);
+                    for j in 0..classes {
+                        back.data[row + j] = math.exp(l.data[row + j] - lse) * scale;
+                    }
+                    back.data[row + targets[i]] -= scale;
+                }
+                self.accumulate(logits, back);
+            }
             Mean(a) => {
                 let shape = self.values[a].shape;
                 let n = array.size(shape) as f64;
@@ -240,4 +315,18 @@ impl Graph {
         let sum = self.grads[t] + g;
         self.grads[t] = sum;
     }
+}
+
+// log(Σ exp(xs[from..from + n])), with the largest taken out first so no
+// `exp` overflows.
+fun log_sum_exp(xs: f64[], from: i64, n: i64): f64 {
+    let mut top = xs[from];
+    for j in 1..n {
+        top = math.max(top, xs[from + j]);
+    }
+    let mut sum = 0.0;
+    for j in 0..n {
+        sum += math.exp(xs[from + j] - top);
+    }
+    top + math.ln(sum)
 }

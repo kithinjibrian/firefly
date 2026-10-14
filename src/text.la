@@ -1,0 +1,44 @@
+// Characters as token ids for language models (`import firefly.text;`).
+// Id 0 is `.`, which marks the start and end of a word; the other ids are
+// the distinct characters of the training text, in order.
+
+public struct Vocab { public chars: char[] }
+
+// The vocabulary of `lines`: `.` first, then every character they use,
+// sorted. `.` is reserved, so it may not appear in the lines.
+public fun from_lines(lines: string[]): Vocab {
+    let mut seen: char[] = [];
+    for line of lines {
+        for c of line.chars() {
+            if c == '.' {
+                panic("`.` marks word boundaries, so the text may not contain it: {line}");
+            }
+            if !seen.iter().any(fun(x: char): bool = x == c) {
+                seen.push(c);
+            }
+        }
+    }
+    let mut chars = ['.'];
+    for c of seen.sort_by(fun(a: char, b: char): bool = a < b) {
+        chars.push(c);
+    }
+    Vocab { chars: chars }
+}
+
+impl Vocab {
+    // The number of tokens, `.` included.
+    public fun size(self): i64 = self.chars.len;
+
+    // `c`'s id; panics for a character the vocabulary doesn't have.
+    public fun encode(self, c: char): i64 {
+        for i in 0..self.chars.len {
+            if self.chars[i] == c {
+                return i;
+            }
+        }
+        panic("{c} isn't in the vocabulary")
+    }
+
+    // The character with id `id`.
+    public fun decode(self, id: i64): char = self.chars[id];
+}

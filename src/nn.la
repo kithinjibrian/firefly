@@ -1,0 +1,17 @@
+// Plain-array helpers for models (`import firefly.nn;`).
+import std.math;
+
+// Probabilities from scores: exp(x) / Σ exp, with the largest score taken
+// out first so nothing overflows.
+public fun softmax(xs: f64[]): f64[] {
+    let mut top = xs[0];
+    for x of xs {
+        top = math.max(top, x);
+    }
+    let exps = xs.map(fun(x: f64): f64 = math.exp(x - top));
+    let mut total = 0.0;
+    for e of exps {
+        total += e;
+    }
+    exps.map(fun(e: f64): f64 = e / total)
+}

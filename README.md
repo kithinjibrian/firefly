@@ -5,6 +5,7 @@ A small PyTorch-style deep-learning library written in [Lugha](https://github.co
 ```sh
 lughac run example/xor.la        # a 2-layer network learns XOR
 lughac run example/gradcheck.la  # every op's gradient vs. a finite difference
+lughac run example/bigram.la     # a character bigram model of names, then samples
 ```
 
 ## How it works
@@ -35,13 +36,15 @@ for step in 0..1000 {
 
 | Module | What's in it |
 | --- | --- |
-| `firefly.graph` | `param`, `input`, `value`, `grad`, `set_value`, `reset`; ops `add`, `sub`, `mul`, `matmul`, `add_row` (bias), `tanh`, `relu`, `sigmoid`, `sum`, `mean`; `backward`, `sgd` |
-| `firefly.random` | `seeded(seed)` or `from_os()`, then `uniform()`, `normal(mean, std)`, `below(n)`, `shuffle(xs)`, `normals(shape, scale)`; a thin wrapper over Lugha's `std.random` (xoshiro256\*\*) |
+| `firefly.graph` | `param`, `input`, `value`, `grad`, `set_value`, `reset`; ops `add`, `sub`, `mul`, `matmul`, `add_row` (bias), `tanh`, `relu`, `sigmoid`, `sum`, `mean`, `rows` (embedding lookup), `cross_entropy` (stable softmax + negative log-likelihood); `backward`, `sgd` |
+| `firefly.text` | `from_lines(lines)` → a character `Vocab` (`.` = word boundary, id 0); `size`, `encode`, `decode` |
+| `firefly.nn` | `softmax(xs)` |
+| `firefly.random` | `seeded(seed)` or `from_os()`, then `uniform()`, `normal(mean, std)`, `below(n)`, `shuffle(xs)`, `pick(probs)` (weighted), `normals(shape, scale)`; a thin wrapper over Lugha's `std.random` (xoshiro256\*\*) |
 
 ## Roadmap
 
 1. ✅ Tape autograd, SGD, XOR.
-2. A bigram character model: embeddings, softmax cross-entropy, sampling text.
+2. ✅ A bigram character model (`example/bigram.la`, on `data/names.txt`): reaches the counting optimum's loss, samples names.
 3. An MLP language model: context windows, Adam, train/validation split.
 4. A tiny transformer: causal self-attention, layernorm, GELU — a mini GPT.
 

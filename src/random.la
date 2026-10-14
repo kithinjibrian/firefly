@@ -19,6 +19,20 @@ impl Rng {
     // A normal value with mean `mean` and deviation `std`.
     public fun normal(mut self, mean: f64, std: f64): f64 = self.inner.normal(mean, std);
 
+    // An index drawn with probability `probs[i]` (which should sum to 1);
+    // the last index if rounding leaves the draw past the end.
+    public fun pick(mut self, probs: f64[]): i64 {
+        let u = self.inner.uniform();
+        let mut acc = 0.0;
+        for i in 0..probs.len {
+            acc += probs[i];
+            if u < acc {
+                return i;
+            }
+        }
+        probs.len - 1
+    }
+
     // A copy of `xs` in random order.
     public fun shuffle<T>(mut self, xs: T[]): T[] = self.inner.shuffle(xs);
 

@@ -1,2 +1,4 @@
 /target
 /example/xor
+/example/bigram
+/example/gradcheck

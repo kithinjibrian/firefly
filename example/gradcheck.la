@@ -20,7 +20,11 @@ fun build(g: graph.Graph, x: array.NdArray<f64>): (graph.Graph, i64) {
     let e = g.add(d, s);
     let total = g.sum(e);
     let both = g.add(total, total);
-    let loss = g.mean(both);
+    let mean = g.mean(both);
+    // An embedding lookup (a repeated row included) and cross-entropy.
+    let looked = g.rows(2, [1, 3, 3, 0]);
+    let ce = g.cross_entropy(looked, [0, 2, 1, 3]);
+    let loss = g.add(mean, ce);
     (g, loss)
 }
 
@@ -29,6 +33,7 @@ fun main() {
     let mut g = graph.new();
     let w = g.param(rng.normals([3, 4], 1.0));
     let b = g.param(rng.normals([4], 1.0));
+    let table = g.param(rng.normals([5, 4], 2.0));
     let x = rng.normals([2, 3], 1.0);
 
     let (built, loss) = build(g, x);
@@ -36,7 +41,7 @@ fun main() {
     g.backward(loss);
     let h = 0.000001;
     let mut worst = 0.0;
-    for p of [w, b] {
+    for p of [w, b, table] {
         let analytic = g.grad(p);
         for k in 0..analytic.data.len {
             let mut up = g;
