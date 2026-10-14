@@ -1,6 +1,6 @@
 # firefly
 
-A small PyTorch-style deep-learning library written in [Lugha](https://github.com/kithinjibrian/lugha), on top of [glowworm](https://github.com/kithinjibrian/glowworm)'s n-dimensional arrays. The goal: train a tiny GPT.
+A small PyTorch-style deep-learning library written in [Lugha](https://github.com/kithinjibrian/lugha), on top of [glowworm](https://github.com/kithinjibrian/glowworm)'s n-dimensional arrays.
 
 ```sh
 lughac run example/xor.la        # a 2-layer network learns XOR
@@ -36,7 +36,7 @@ for step in 0..1000 {
 | Module | What's in it |
 | --- | --- |
 | `firefly.graph` | `param`, `input`, `value`, `grad`, `set_value`, `reset`; ops `add`, `sub`, `mul`, `matmul`, `add_row` (bias), `tanh`, `relu`, `sigmoid`, `sum`, `mean`; `backward`, `sgd` |
-| `firefly.random` | `seeded(seed)`, then `uniform()`, `normal()`, `below(n)`, `normals(shape, scale)` (xorshift64*, repeatable) |
+| `firefly.random` | `seeded(seed)` or `from_os()`, then `uniform()`, `normal(mean, std)`, `below(n)`, `shuffle(xs)`, `normals(shape, scale)`; a thin wrapper over Lugha's `std.random` (xoshiro256\*\*) |
 
 ## Roadmap
 

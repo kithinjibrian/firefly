@@ -1,42 +1,32 @@
-// Pseudo-random numbers for initialising weights and sampling text:
-// xorshift64*, seeded, so a run can be repeated exactly.
+// Random numbers for firefly: std.random's generator (xoshiro256**,
+// seeded, repeatable), plus `normals` for initialising weight arrays.
+// Use `random.seeded(n)` for repeatable runs, `random.from_os()` otherwise.
 import glowworm.array;
-import std.math;
+import std.random as rand;
 
-public struct Rng { state: u64 }
+public struct Rng { inner: rand.Rng }
 
-// A generator from `seed`; any seed works, `0` included.
-public fun seeded(seed: u64): Rng = Rng { state: seed ^ 0x9E3779B97F4A7C15 };
+public fun seeded(seed: u64): Rng = Rng { inner: rand.seeded(seed) };
+public fun from_os(): Rng = Rng { inner: rand.from_os() };
 
 impl Rng {
-    // The next 64 random bits.
-    public fun next_u64(mut self): u64 {
-        let mut x = self.state;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.state = x;
-        x.wrapping_mul(0x2545F4914F6CDD1D)
-    }
-
     // Uniform in [0, 1).
-    public fun uniform(mut self): f64 = (self.next_u64() >> 11) as f64 / 9007199254740992.0;
+    public fun uniform(mut self): f64 = self.inner.uniform();
 
     // An integer in 0..n.
-    public fun below(mut self, n: i64): i64 = (self.uniform() * n as f64) as i64 % n;
+    public fun below(mut self, n: i64): i64 = self.inner.below(n);
 
-    // Standard normal (mean 0, deviation 1), by Box–Muller.
-    public fun normal(mut self): f64 {
-        let u = 1.0 - self.uniform();
-        let v = self.uniform();
-        math.sqrt(-2.0 * math.ln(u)) * math.cos(2.0 * math.pi() * v)
-    }
+    // A normal value with mean `mean` and deviation `std`.
+    public fun normal(mut self, mean: f64, std: f64): f64 = self.inner.normal(mean, std);
 
-    // An array of `shape` with normal values times `scale`.
+    // A copy of `xs` in random order.
+    public fun shuffle<T>(mut self, xs: T[]): T[] = self.inner.shuffle(xs);
+
+    // An array of `shape` with normal values of deviation `scale`.
     public fun normals(mut self, shape: i64[], scale: f64): array.NdArray<f64> {
         let mut data: f64[] = [];
         for i in 0..array.size(shape) {
-            data.push(self.normal() * scale);
+            data.push(self.inner.normal(0.0, scale));
         }
         array.from(shape, data)
     }
