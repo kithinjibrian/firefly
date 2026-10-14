@@ -2,3 +2,4 @@
 /example/xor
 /example/bigram
 /example/gradcheck
+/example/mlp

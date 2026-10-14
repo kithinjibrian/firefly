@@ -16,7 +16,7 @@
 //
 // Ops: add, sub, mul (element-wise), matmul, add_row (bias), tanh, relu,
 // sigmoid, sum, mean, rows (embedding lookup), cross_entropy (softmax +
-// negative log-likelihood).
+// negative log-likelihood), reshape. Optimisers: sgd, adam, adamw.
 import glowworm.array;
 import glowworm.linalg;
 import std.math;
@@ -36,6 +36,7 @@ enum Op {
     Mean(i64),
     Rows(i64, i64[]),
     CrossEntropy(i64, i64[]),
+    Reshape(i64),
 }
 
 public struct Graph {
@@ -44,9 +45,15 @@ public struct Graph {
     ops: Op[],
     // The first `params` tensors are parameters, which `reset` keeps.
     params: i64,
+    // Adam's running averages of each parameter's gradient and squared
+    // gradient, and its step count.
+    moments: array.NdArray<f64>[],
+    squares: array.NdArray<f64>[],
+    steps: i64,
 }
 
-public fun new(): Graph = Graph { values: [], grads: [], ops: [], params: 0 };
+public fun new(): Graph =
+    Graph { values: [], grads: [], ops: [], params: 0, moments: [], squares: [], steps: 0 };
 
 impl Graph {
     // ---- Tensors -------------------------------------------------------
@@ -183,6 +190,12 @@ impl Graph {
         self.push(array.from([ids.len, dim], data), Op.Rows(table, ids))
     }
 
+    // The same elements in another shape (sizes must agree).
+    public fun reshape(mut self, a: i64, shape: i64[]): i64 {
+        let v = self.values[a].reshape(shape);
+        self.push(v, Op.Reshape(a))
+    }
+
     // The mean negative log-likelihood of `targets` under softmax(`logits`)
     // row by row: (n × classes) logits, n target classes. Computed through
     // the log-sum-exp with each row's maximum taken out, so large logits
@@ -224,6 +237,42 @@ impl Graph {
         for i in 0..self.params {
             let step = self.grads[i].scale(lr);
             self.values[i] = self.values[i] - step;
+        }
+    }
+
+    // Adam (Kingma and Ba): each parameter moves by its bias-corrected
+    // average gradient over the root of its average squared gradient, so
+    // every weight gets a step of about `lr` whatever its gradient's scale.
+    public fun adam(mut self, lr: f64) {
+        self.adamw(lr, 0.0);
+    }
+
+    // Adam with decoupled weight decay (AdamW, Loshchilov and Hutter): each
+    // step also shrinks every parameter by `lr * decay` of itself, which
+    // keeps weights small and curbs overfitting.
+    public fun adamw(mut self, lr: f64, decay: f64) {
+        let (b1, b2, eps) = (0.9, 0.999, 0.00000001);
+        if self.moments.len == 0 {
+            for i in 0..self.params {
+                self.moments.push(array.zeros(self.values[i].shape));
+                self.squares.push(array.zeros(self.values[i].shape));
+            }
+        }
+        self.steps += 1;
+        let fix1 = 1.0 - math.pow(b1, self.steps as f64);
+        let fix2 = 1.0 - math.pow(b2, self.steps as f64);
+        for i in 0..self.params {
+            let g = self.grads[i];
+            let m = self.moments[i].scale(b1) + g.scale(1.0 - b1);
+            let s = self.squares[i].scale(b2) + (g * g).scale(1.0 - b2);
+            let mut p = self.values[i];
+            for k in 0..p.data.len {
+                let step = (m.data[k] / fix1) / (math.sqrt(s.data[k] / fix2) + eps);
+                p.data[k] -= lr * (step + decay * p.data[k]);
+            }
+            self.moments[i] = m;
+            self.squares[i] = s;
+            self.values[i] = p;
         }
     }
 
@@ -302,6 +351,10 @@ impl Graph {
                     back.data[row + targets[i]] -= scale;
                 }
                 self.accumulate(logits, back);
+            }
+            Reshape(a) => {
+                let shape = self.values[a].shape;
+                self.accumulate(a, g.reshape(shape));
             }
             Mean(a) => {
                 let shape = self.values[a].shape;

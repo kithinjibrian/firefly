@@ -6,6 +6,7 @@ A small PyTorch-style deep-learning library written in [Lugha](https://github.co
 lughac run example/xor.la        # a 2-layer network learns XOR
 lughac run example/gradcheck.la  # every op's gradient vs. a finite difference
 lughac run example/bigram.la     # a character bigram model of names, then samples
+lughac build -O2 example/mlp.la -o mlp && ./mlp   # an MLP language model (build with -O2: ~4× faster)
 ```
 
 ## How it works
@@ -36,7 +37,7 @@ for step in 0..1000 {
 
 | Module | What's in it |
 | --- | --- |
-| `firefly.graph` | `param`, `input`, `value`, `grad`, `set_value`, `reset`; ops `add`, `sub`, `mul`, `matmul`, `add_row` (bias), `tanh`, `relu`, `sigmoid`, `sum`, `mean`, `rows` (embedding lookup), `cross_entropy` (stable softmax + negative log-likelihood); `backward`, `sgd` |
+| `firefly.graph` | `param`, `input`, `value`, `grad`, `set_value`, `reset`; ops `add`, `sub`, `mul`, `matmul`, `add_row` (bias), `tanh`, `relu`, `sigmoid`, `sum`, `mean`, `rows` (embedding lookup), `cross_entropy` (stable softmax + negative log-likelihood), `reshape`; `backward`; optimisers `sgd`, `adam`, `adamw` (weight decay) |
 | `firefly.text` | `from_lines(lines)` → a character `Vocab` (`.` = word boundary, id 0); `size`, `encode`, `decode` |
 | `firefly.nn` | `softmax(xs)` |
 | `firefly.random` | `seeded(seed)` or `from_os()`, then `uniform()`, `normal(mean, std)`, `below(n)`, `shuffle(xs)`, `pick(probs)` (weighted), `normals(shape, scale)`; a thin wrapper over Lugha's `std.random` (xoshiro256\*\*) |
@@ -45,7 +46,11 @@ for step in 0..1000 {
 
 1. ✅ Tape autograd, SGD, XOR.
 2. ✅ A bigram character model (`example/bigram.la`, on `data/names.txt`): reaches the counting optimum's loss, samples names.
-3. An MLP language model: context windows, Adam, train/validation split.
+3. ✅ An MLP language model (`example/mlp.la`): 3 characters of context, embeddings, a tanh layer, AdamW, minibatches, a train/validation split. On held-out names it beats the bigram model (validation loss 2.26 vs 2.41) and samples new name-like words.
 4. A tiny transformer: causal self-attention, layernorm, GELU — a mini GPT.
+
+The bundled `data/names.txt` is small (229 names), so models overfit quickly; weight decay keeps the MLP honest. A larger names file (e.g. makemore's `names.txt`, 32k names) drops in as is.
+
+Speed: every graph op currently copies the arrays it reads (a Lugha limitation noted in its TODO), so training is a few times slower than the arithmetic alone would be. Build examples with `-O2`.
 
 firefly depends on glowworm through `lugha.toml` (`glowworm = { path = "../glowworm", version = "0.1" }`), so clone both side by side.

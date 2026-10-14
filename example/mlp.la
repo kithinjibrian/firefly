@@ -1,0 +1,169 @@
+// An MLP language model of names (Bengio et al. 2003; makemore, part 2):
+// the last 3 characters, each embedded as 10 numbers, go through a hidden
+// layer of 32 tanh units to scores for the next character. Trained with
+// AdamW (weight decay keeps it from memorising the small dataset) on
+// minibatches, and checked on names it never saw. Run from the repository
+// root, optimised:
+//     lughac build -O2 example/mlp.la -o mlp && ./mlp
+import glowworm.array;
+import firefly.graph;
+import firefly.nn;
+import firefly.random;
+import firefly.text;
+import std.math;
+
+// The model's parameters, as ids in its graph.
+struct Lm {
+    g: graph.Graph,
+    table: i64,
+    w1: i64,
+    b1: i64,
+    w2: i64,
+    b2: i64,
+}
+
+// How many characters of context, and the size of each embedding.
+fun block(): i64 = 3;
+fun dims(): i64 = 10;
+
+impl Lm {
+    // Scores over the vocabulary for `n` contexts, `contexts` holding each
+    // context's `block()` ids one after another.
+    fun logits(mut self, contexts: i64[], n: i64): i64 {
+        let (table, w1, b1, w2, b2) = (self.table, self.w1, self.b1, self.w2, self.b2);
+        let e = self.g.rows(table, contexts);
+        let flat = self.g.reshape(e, [n, block() * dims()]);
+        let z1 = self.g.matmul(flat, w1);
+        let a1 = self.g.add_row(z1, b1);
+        let h = self.g.tanh(a1);
+        let z2 = self.g.matmul(h, w2);
+        self.g.add_row(z2, b2)
+    }
+
+    // The loss on every example of a split, without training.
+    fun loss_on(mut self, contexts: i64[], targets: i64[]): f64 {
+        self.g.reset();
+        let logits = self.logits(contexts, targets.len);
+        let loss = self.g.cross_entropy(logits, targets);
+        self.g.value(loss).data[0]
+    }
+}
+
+// Every (context, next character) example of `names`, contexts flattened.
+fun examples(names: string[], vocab: text.Vocab): (i64[], i64[]) {
+    let mut contexts: i64[] = [];
+    let mut targets: i64[] = [];
+    for name of names {
+        let mut context = [0; block()];
+        let mut ids: i64[] = [];
+        for c of name.chars() {
+            ids.push(vocab.encode(c));
+        }
+        ids.push(0);
+        for id of ids {
+            for c of context {
+                contexts.push(c);
+            }
+            targets.push(id);
+            for k in 1..block() {
+                context[k - 1] = context[k];
+            }
+            context[block() - 1] = id;
+        }
+    }
+    (contexts, targets)
+}
+
+fun main() {
+    let raw = match read_file("data/names.txt") {
+        Ok(t) => t,
+        Err(e) => panic("can't read data/names.txt ({e}): run from the repository root"),
+    };
+    let mut rng = random.seeded(42);
+    let names = rng.shuffle(raw.lines().filter(fun(l: string): bool = l.len > 0));
+    let vocab = text.from_lines(names);
+    let v = vocab.size();
+
+    // 90% of the names to learn from, 10% held back to check generalising.
+    let cut = names.len * 9 / 10;
+    let mut train_names: string[] = [];
+    let mut val_names: string[] = [];
+    for i in 0..names.len {
+        if i < cut { train_names.push(names[i]); } else { val_names.push(names[i]); }
+    }
+    let (train_x, train_y) = examples(train_names, vocab);
+    let (val_x, val_y) = examples(val_names, vocab);
+    println("{train_y.len} training examples, {val_y.len} validation examples, {v} tokens");
+
+    let hidden = 32;
+    let mut g = graph.new();
+    let table = g.param(rng.normals([v, dims()], 1.0));
+    let w1 = g.param(rng.normals([block() * dims(), hidden], 0.2));
+    let b1 = g.param(array.zeros([hidden]));
+    let w2 = g.param(rng.normals([hidden, v], 0.01));
+    let b2 = g.param(array.zeros([v]));
+    let mut lm = Lm { g: g, table: table, w1: w1, b1: b1, w2: w2, b2: b2 };
+
+    let batch = 32;
+    for step in 0..2001 {
+        let mut contexts: i64[] = [];
+        let mut targets: i64[] = [];
+        for b in 0..batch {
+            let k = rng.below(train_y.len);
+            for c in 0..block() {
+                contexts.push(train_x[k * block() + c]);
+            }
+            targets.push(train_y[k]);
+        }
+        lm.g.reset();
+        let logits = lm.logits(contexts, batch);
+        let loss = lm.g.cross_entropy(logits, targets);
+        lm.g.backward(loss);
+        lm.g.adamw(if step < 1500 { 0.01 } else { 0.001 }, 0.3);
+        if step % 500 == 0 {
+            println("step {step:>4}  batch loss {lm.g.value(loss).data[0]:.4}");
+        }
+    }
+    println("train loss {lm.loss_on(train_x, train_y):.4}, validation loss {lm.loss_on(val_x, val_y):.4}");
+    println("for comparison, a bigram model's validation loss: {bigram_loss(train_x, train_y, val_x, val_y, v):.4}");
+
+    println("samples:");
+    for i in 0..10 {
+        let mut context = [0; block()];
+        let mut name = "";
+        while true {
+            lm.g.reset();
+            let logits = lm.logits(context, 1);
+            let x = rng.pick(nn.softmax(lm.g.value(logits).data));
+            if x == 0 {
+                break;
+            }
+            name = "{name}{vocab.decode(x)}";
+            for k in 1..block() {
+                context[k - 1] = context[k];
+            }
+            context[block() - 1] = x;
+        }
+        println("  {name}");
+    }
+}
+
+// A smoothed bigram model counted on the training examples (the last
+// character of each context predicts the next), scored on the validation
+// examples: the baseline the MLP's longer context should beat.
+fun bigram_loss(train_x: i64[], train_y: i64[], val_x: i64[], val_y: i64[], v: i64): f64 {
+    let mut counts = [0.1; v * v];
+    for k in 0..train_y.len {
+        counts[train_x[k * block() + block() - 1] * v + train_y[k]] += 1.0;
+    }
+    let mut nll = 0.0;
+    for k in 0..val_y.len {
+        let prev = val_x[k * block() + block() - 1];
+        let mut row = 0.0;
+        for j in 0..v {
+            row += counts[prev * v + j];
+        }
+        nll -= math.ln(counts[prev * v + val_y[k]] / row);
+    }
+    nll / val_y.len as f64
+}
