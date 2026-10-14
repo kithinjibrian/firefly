@@ -16,7 +16,9 @@
 //
 // Ops: add, sub, mul (element-wise), matmul, add_row (bias), tanh, relu,
 // sigmoid, sum, mean, rows (embedding lookup), cross_entropy (softmax +
-// negative log-likelihood), reshape. Optimisers: sgd, adam, adamw.
+// negative log-likelihood), reshape; for transformers transpose, scale,
+// mul_row (gain), causal_softmax, layernorm, gelu, cols and concat (heads).
+// Optimisers: sgd, adam, adamw.
 import glowworm.array;
 import glowworm.linalg;
 import std.math;
@@ -37,6 +39,14 @@ enum Op {
     Rows(i64, i64[]),
     CrossEntropy(i64, i64[]),
     Reshape(i64),
+    Transpose(i64),
+    Scale(i64, f64),
+    MulRow(i64, i64),
+    CausalSoftmax(i64),
+    LayerNorm(i64),
+    Gelu(i64),
+    Cols(i64, i64),
+    Concat(i64, i64),
 }
 
 public struct Graph {
@@ -142,10 +152,7 @@ impl Graph {
     }
 
     public fun tanh(mut self, a: i64): i64 {
-        let v = self.values[a].map(fun(x: f64): f64 {
-            let e = math.exp(2.0 * x);
-            (e - 1.0) / (e + 1.0)
-        });
+        let v = self.values[a].map(fun(x: f64): f64 = tanh_of(x));
         self.push(v, Op.Tanh(a))
     }
 
@@ -194,6 +201,109 @@ impl Graph {
     public fun reshape(mut self, a: i64, shape: i64[]): i64 {
         let v = self.values[a].reshape(shape);
         self.push(v, Op.Reshape(a))
+    }
+
+    // A 2-D tensor with rows and columns swapped.
+    public fun transpose(mut self, a: i64): i64 {
+        let v = self.values[a].transpose();
+        self.push(v, Op.Transpose(a))
+    }
+
+    // Every element times the constant `k`.
+    public fun scale(mut self, a: i64, k: f64): i64 {
+        let v = self.values[a].scale(k);
+        self.push(v, Op.Scale(a, k))
+    }
+
+    // An (m × n) matrix times an (n) row, element-wise in every row: a
+    // layer's gain, as `add_row` is its bias.
+    public fun mul_row(mut self, a: i64, row: i64): i64 {
+        let (m, r) = (self.values[a], self.values[row]);
+        if m.shape.len != 2 || r.shape != [m.shape[1]] {
+            panic("mul_row needs (m × n) and (n), not {m.shape} and {r.shape}");
+        }
+        let n = m.shape[1];
+        let mut out = m;
+        for i in 0..out.data.len {
+            out.data[i] *= r.data[i % n];
+        }
+        self.push(out, Op.MulRow(a, row))
+    }
+
+    // Softmax along each row of a square (T × T) matrix of attention
+    // scores, where row i may only look at columns 0..=i: later positions
+    // get probability 0, so a token never sees the future.
+    public fun causal_softmax(mut self, a: i64): i64 {
+        let s = self.values[a];
+        if s.shape.len != 2 || s.shape[0] != s.shape[1] {
+            panic("causal_softmax needs a square matrix, not shape {s.shape}");
+        }
+        let t = s.shape[0];
+        let mut out: array.NdArray<f64> = array.zeros(s.shape);
+        for i in 0..t {
+            let lse = log_sum_exp(s.data, i * t, i + 1);
+            for j in 0..i + 1 {
+                out.data[i * t + j] = math.exp(s.data[i * t + j] - lse);
+            }
+        }
+        self.push(out, Op.CausalSoftmax(a))
+    }
+
+    // Each row shifted to mean 0 and scaled to variance 1 (layer
+    // normalisation, without its gain and bias: add those with `mul_row`
+    // and `add_row`).
+    public fun layernorm(mut self, a: i64): i64 {
+        let x = self.values[a];
+        let n = x.shape[x.shape.len - 1];
+        let mut out = x;
+        for row in 0..x.data.len / n {
+            let (mean, inv) = row_stats(x.data, row * n, n);
+            for j in 0..n {
+                out.data[row * n + j] = (x.data[row * n + j] - mean) * inv;
+            }
+        }
+        self.push(out, Op.LayerNorm(a))
+    }
+
+    // GELU, the smooth ReLU transformers use (tanh approximation).
+    public fun gelu(mut self, a: i64): i64 {
+        let v = self.values[a].map(fun(x: f64): f64 = 0.5 * x * (1.0 + tanh_of(gelu_inner(x))));
+        self.push(v, Op.Gelu(a))
+    }
+
+    // Columns `from..from + n` of a matrix: one attention head's slice.
+    public fun cols(mut self, a: i64, from: i64, n: i64): i64 {
+        let x = self.values[a];
+        let (m, w) = (x.shape[0], x.shape[1]);
+        if from < 0 || n <= 0 || from + n > w {
+            panic("cols {from}..{from + n} are outside a matrix {w} wide");
+        }
+        let mut data: f64[] = [];
+        for i in 0..m {
+            for j in from..from + n {
+                data.push(x.data[i * w + j]);
+            }
+        }
+        self.push(array.from([m, n], data), Op.Cols(a, from))
+    }
+
+    // Two matrices with the same number of rows, side by side.
+    public fun concat(mut self, a: i64, b: i64): i64 {
+        let (x, y) = (self.values[a], self.values[b]);
+        if x.shape.len != 2 || y.shape.len != 2 || x.shape[0] != y.shape[0] {
+            panic("concat needs two matrices with as many rows, not {x.shape} and {y.shape}");
+        }
+        let (m, wa, wb) = (x.shape[0], x.shape[1], y.shape[1]);
+        let mut data: f64[] = [];
+        for i in 0..m {
+            for j in 0..wa {
+                data.push(x.data[i * wa + j]);
+            }
+            for j in 0..wb {
+                data.push(y.data[i * wb + j]);
+            }
+        }
+        self.push(array.from([m, wa + wb], data), Op.Concat(a, b))
     }
 
     // The mean negative log-likelihood of `targets` under softmax(`logits`)
@@ -356,6 +466,98 @@ impl Graph {
                 let shape = self.values[a].shape;
                 self.accumulate(a, g.reshape(shape));
             }
+            Transpose(a) => {
+                self.accumulate(a, g.transpose());
+            }
+            Scale(a, k) => {
+                self.accumulate(a, g.scale(k));
+            }
+            MulRow(a, row) => {
+                let (m, r) = (self.values[a], self.values[row]);
+                let n = r.data.len;
+                let mut ga = g;
+                let mut gr: array.NdArray<f64> = array.zeros(r.shape);
+                for k in 0..g.data.len {
+                    ga.data[k] = g.data[k] * r.data[k % n];
+                    gr.data[k % n] += g.data[k] * m.data[k];
+                }
+                self.accumulate(a, ga);
+                self.accumulate(row, gr);
+            }
+            CausalSoftmax(a) => {
+                // dx = y * (g - Σ g·y), row by row; masked entries have y = 0.
+                let y = self.values[i];
+                let t = y.shape[0];
+                let mut back: array.NdArray<f64> = array.zeros(y.shape);
+                for r in 0..t {
+                    let mut dot = 0.0;
+                    for c in 0..t {
+                        dot += g.data[r * t + c] * y.data[r * t + c];
+                    }
+                    for c in 0..t {
+                        back.data[r * t + c] = y.data[r * t + c] * (g.data[r * t + c] - dot);
+                    }
+                }
+                self.accumulate(a, back);
+            }
+            LayerNorm(a) => {
+                // dx = (g - mean(g) - x̂ · mean(g · x̂)) / σ, row by row.
+                let x = self.values[a];
+                let xhat = self.values[i];
+                let n = x.shape[x.shape.len - 1];
+                let mut back = g;
+                for row in 0..x.data.len / n {
+                    let (_, inv) = row_stats(x.data, row * n, n);
+                    let mut mean_g = 0.0;
+                    let mut mean_gx = 0.0;
+                    for j in 0..n {
+                        mean_g += g.data[row * n + j];
+                        mean_gx += g.data[row * n + j] * xhat.data[row * n + j];
+                    }
+                    mean_g /= n as f64;
+                    mean_gx /= n as f64;
+                    for j in 0..n {
+                        let k = row * n + j;
+                        back.data[k] = (g.data[k] - mean_g - xhat.data[k] * mean_gx) * inv;
+                    }
+                }
+                self.accumulate(a, back);
+            }
+            Gelu(a) => {
+                let x = self.values[a];
+                let mut back = g;
+                for k in 0..x.data.len {
+                    back.data[k] = g.data[k] * gelu_slope(x.data[k]);
+                }
+                self.accumulate(a, back);
+            }
+            Cols(a, from) => {
+                let x = self.values[a];
+                let (m, w, n) = (x.shape[0], x.shape[1], g.shape[1]);
+                let mut back: array.NdArray<f64> = array.zeros(x.shape);
+                for r in 0..m {
+                    for j in 0..n {
+                        back.data[r * w + from + j] = g.data[r * n + j];
+                    }
+                }
+                self.accumulate(a, back);
+            }
+            Concat(a, b) => {
+                let (wa, wb) = (self.values[a].shape[1], self.values[b].shape[1]);
+                let m = g.shape[0];
+                let mut ga: f64[] = [];
+                let mut gb: f64[] = [];
+                for r in 0..m {
+                    for j in 0..wa {
+                        ga.push(g.data[r * (wa + wb) + j]);
+                    }
+                    for j in 0..wb {
+                        gb.push(g.data[r * (wa + wb) + wa + j]);
+                    }
+                }
+                self.accumulate(a, array.from([m, wa], ga));
+                self.accumulate(b, array.from([m, wb], gb));
+            }
             Mean(a) => {
                 let shape = self.values[a].shape;
                 let n = array.size(shape) as f64;
@@ -382,4 +584,43 @@ fun log_sum_exp(xs: f64[], from: i64, n: i64): f64 {
         sum += math.exp(xs[from + j] - top);
     }
     top + math.ln(sum)
+}
+
+// A row's mean and 1 / (standard deviation), with a small epsilon so a
+// constant row doesn't divide by zero.
+fun row_stats(xs: f64[], from: i64, n: i64): (f64, f64) {
+    let mut mean = 0.0;
+    for j in 0..n {
+        mean += xs[from + j];
+    }
+    mean /= n as f64;
+    let mut var = 0.0;
+    for j in 0..n {
+        let d = xs[from + j] - mean;
+        var += d * d;
+    }
+    var /= n as f64;
+    (mean, 1.0 / math.sqrt(var + 0.00001))
+}
+
+// tanh, saturating to ±1 where exp would overflow.
+fun tanh_of(x: f64): f64 {
+    if x > 20.0 {
+        return 1.0;
+    }
+    if x < -20.0 {
+        return -1.0;
+    }
+    let e = math.exp(2.0 * x);
+    (e - 1.0) / (e + 1.0)
+}
+
+// GELU's tanh argument: √(2/π) · (x + 0.044715 x³).
+fun gelu_inner(x: f64): f64 = 0.7978845608028654 * (x + 0.044715 * x * x * x);
+
+// d/dx of 0.5 · x · (1 + tanh(u(x))).
+fun gelu_slope(x: f64): f64 {
+    let t = tanh_of(gelu_inner(x));
+    let du = 0.7978845608028654 * (1.0 + 3.0 * 0.044715 * x * x);
+    0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * du
 }

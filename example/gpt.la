@@ -1,0 +1,260 @@
+// A tiny GPT on names: token and position embeddings, one transformer
+// block (layernorm, causal multi-head self-attention, a GELU MLP, residual
+// connections), and a final layernorm and linear head, trained with AdamW
+// to predict the next character of a stream of names. Small (16 wide,
+// 2 heads, ~4k parameters) and strongly regularised, because the bundled
+// dataset is tiny; scale `width`, `heads` and the steps up with more data.
+// Run from the
+// repository root, optimised:
+//     lughac build -O2 example/gpt.la -o gpt && ./gpt
+import glowworm.array;
+import firefly.graph;
+import firefly.nn;
+import firefly.random;
+import firefly.text;
+import std.math;
+
+// The context length, embedding width, and attention heads.
+fun block(): i64 = 8;
+fun width(): i64 = 16;
+fun heads(): i64 = 2;
+
+// The parameters, as ids in the graph.
+struct Params {
+    wte: i64, wpe: i64,
+    ln1g: i64, ln1b: i64, wq: i64, wk: i64, wv: i64, wo: i64,
+    ln2g: i64, ln2b: i64, w1: i64, c1: i64, w2: i64, c2: i64,
+    lnfg: i64, lnfb: i64, wlm: i64, blm: i64,
+}
+
+struct Gpt { g: graph.Graph, p: Params }
+
+// A weight matrix with deviation 1/√fan-in, so activations keep their scale.
+fun weights(rng: random.Rng, rows: i64, cols: i64): (random.Rng, array.NdArray<f64>) {
+    let mut r = rng;
+    let w = r.normals([rows, cols], 1.0 / math.sqrt(rows as f64));
+    (r, w)
+}
+
+fun new_gpt(vocab: i64, seed: u64): Gpt {
+    let mut rng = random.seeded(seed);
+    let mut g = graph.new();
+    let (c, f) = (width(), 4 * width());
+    let ones: array.NdArray<f64> = array.ones([c]);
+    let zeros: array.NdArray<f64> = array.zeros([c]);
+    let wte = g.param(rng.normals([vocab, c], 0.5));
+    let wpe = g.param(rng.normals([block(), c], 0.5));
+    let ln1g = g.param(ones);
+    let ln1b = g.param(zeros);
+    let (r1, mq) = weights(rng, c, c);
+    let (r2, mk) = weights(r1, c, c);
+    let (r3, mv) = weights(r2, c, c);
+    let (r4, mo) = weights(r3, c, c);
+    let (r5, m1) = weights(r4, c, f);
+    let (r6, m2) = weights(r5, f, c);
+    let (r7, mlm) = weights(r6, c, vocab);
+    rng = r7;
+    let wq = g.param(mq);
+    let wk = g.param(mk);
+    let wv = g.param(mv);
+    let wo = g.param(mo);
+    let ln2g = g.param(ones);
+    let ln2b = g.param(zeros);
+    let w1 = g.param(m1);
+    let c1 = g.param(array.zeros([f]));
+    let w2 = g.param(m2);
+    let c2 = g.param(zeros);
+    let lnfg = g.param(ones);
+    let lnfb = g.param(zeros);
+    let wlm = g.param(mlm);
+    let blm = g.param(array.zeros([vocab]));
+    let p = Params {
+        wte: wte, wpe: wpe,
+        ln1g: ln1g, ln1b: ln1b, wq: wq, wk: wk, wv: wv, wo: wo,
+        ln2g: ln2g, ln2b: ln2b, w1: w1, c1: c1, w2: w2, c2: c2,
+        lnfg: lnfg, lnfb: lnfb, wlm: wlm, blm: blm,
+    };
+    Gpt { g: g, p: p }
+}
+
+impl Gpt {
+    // `x` normalised, then scaled and shifted by a learned gain and bias.
+    fun norm(mut self, x: i64, gain: i64, bias: i64): i64 {
+        let n = self.g.layernorm(x);
+        let s = self.g.mul_row(n, gain);
+        self.g.add_row(s, bias)
+    }
+
+    // Scores over the vocabulary at each of `ids`' positions, each seeing
+    // only itself and the positions before it.
+    fun forward(mut self, ids: i64[]): i64 {
+        let p = self.p;
+        let t = ids.len;
+        let mut positions: i64[] = [];
+        for i in 0..t {
+            positions.push(i);
+        }
+        let tok = self.g.rows(p.wte, ids);
+        let pos = self.g.rows(p.wpe, positions);
+        let x = self.g.add(tok, pos);
+
+        // Causal multi-head self-attention, with a residual connection.
+        let h = self.norm(x, p.ln1g, p.ln1b);
+        let q = self.g.matmul(h, p.wq);
+        let k = self.g.matmul(h, p.wk);
+        let v = self.g.matmul(h, p.wv);
+        let size = width() / heads();
+        let mut out = -1;
+        for head in 0..heads() {
+            let qh = self.g.cols(q, head * size, size);
+            let kh = self.g.cols(k, head * size, size);
+            let vh = self.g.cols(v, head * size, size);
+            let kt = self.g.transpose(kh);
+            let scores = self.g.matmul(qh, kt);
+            let scaled = self.g.scale(scores, 1.0 / math.sqrt(size as f64));
+            let att = self.g.causal_softmax(scaled);
+            let oh = self.g.matmul(att, vh);
+            out = if head == 0 { oh } else { self.g.concat(out, oh) };
+        }
+        let projected = self.g.matmul(out, p.wo);
+        let x2 = self.g.add(x, projected);
+
+        // The MLP, with a residual connection.
+        let h2 = self.norm(x2, p.ln2g, p.ln2b);
+        let up = self.g.matmul(h2, p.w1);
+        let biased = self.g.add_row(up, p.c1);
+        let act = self.g.gelu(biased);
+        let down = self.g.matmul(act, p.w2);
+        let mlp = self.g.add_row(down, p.c2);
+        let x3 = self.g.add(x2, mlp);
+
+        let hf = self.norm(x3, p.lnfg, p.lnfb);
+        let logits = self.g.matmul(hf, p.wlm);
+        self.g.add_row(logits, p.blm)
+    }
+
+    // The mean loss over every non-overlapping window of `stream`.
+    fun loss_on(mut self, stream: i64[]): f64 {
+        let mut total = 0.0;
+        let mut windows = 0;
+        let mut i = 0;
+        while i + block() + 1 <= stream.len {
+            self.g.reset();
+            let logits = self.forward(slice(stream, i, block()));
+            let loss = self.g.cross_entropy(logits, slice(stream, i + 1, block()));
+            total += self.g.value(loss).data[0];
+            windows += 1;
+            i += block();
+        }
+        total / windows as f64
+    }
+}
+
+fun slice(xs: i64[], from: i64, n: i64): i64[] {
+    let mut out: i64[] = [];
+    for i in from..from + n {
+        out.push(xs[i]);
+    }
+    out
+}
+
+// The names as one stream of ids, each name followed by `.` (id 0).
+fun stream(names: string[], vocab: text.Vocab): i64[] {
+    let mut ids = [0];
+    for name of names {
+        for c of name.chars() {
+            ids.push(vocab.encode(c));
+        }
+        ids.push(0);
+    }
+    ids
+}
+
+// A smoothed bigram model counted on `train`, scored on `val`: the
+// baseline the transformer's longer context should beat.
+fun bigram_loss(train: i64[], val: i64[], v: i64): f64 {
+    let mut counts = [0.1; v * v];
+    for k in 1..train.len {
+        counts[train[k - 1] * v + train[k]] += 1.0;
+    }
+    let mut nll = 0.0;
+    for k in 1..val.len {
+        let mut row = 0.0;
+        for j in 0..v {
+            row += counts[val[k - 1] * v + j];
+        }
+        nll -= math.ln(counts[val[k - 1] * v + val[k]] / row);
+    }
+    nll / (val.len - 1) as f64
+}
+
+fun main() {
+    let raw = match read_file("data/names.txt") {
+        Ok(t) => t,
+        Err(e) => panic("can't read data/names.txt ({e}): run from the repository root"),
+    };
+    let mut rng = random.seeded(1337);
+    let names = rng.shuffle(raw.lines().filter(fun(l: string): bool = l.len > 0));
+    let vocab = text.from_lines(names);
+    let v = vocab.size();
+    let cut = names.len * 9 / 10;
+    let mut train_names: string[] = [];
+    let mut val_names: string[] = [];
+    for i in 0..names.len {
+        if i < cut { train_names.push(names[i]); } else { val_names.push(names[i]); }
+    }
+    let train = stream(train_names, vocab);
+    let val = stream(val_names, vocab);
+    println("{train.len} training tokens, {val.len} validation tokens, {v} token types");
+
+    let mut gpt = new_gpt(v, 7);
+    let batch = 8;
+    for step in 0..901 {
+        gpt.g.reset();
+        let mut total = -1;
+        for b in 0..batch {
+            let start = rng.below(train.len - block());
+            let logits = gpt.forward(slice(train, start, block()));
+            let loss = gpt.g.cross_entropy(logits, slice(train, start + 1, block()));
+            total = if b == 0 { loss } else { gpt.g.add(total, loss) };
+        }
+        let mean = gpt.g.scale(total, 1.0 / batch as f64);
+        gpt.g.backward(mean);
+        gpt.g.adamw(if step < 700 { 0.005 } else { 0.0005 }, 0.3);
+        if step % 150 == 0 {
+            println("step {step:>4}  batch loss {gpt.g.value(mean).data[0]:.4}");
+        }
+    }
+    println("train loss {gpt.loss_on(train):.4}, validation loss {gpt.loss_on(val):.4}");
+    println("for comparison, a bigram model's validation loss: {bigram_loss(train, val, v):.4}");
+
+    println("samples:");
+    for i in 0..10 {
+        let mut context = [0];
+        let mut name = "";
+        while name.len < 20 {
+            gpt.g.reset();
+            let logits = gpt.forward(context);
+            let scores = gpt.g.value(logits).data;
+            let last = slice_f(scores, (context.len - 1) * v, v);
+            let x = rng.pick(nn.softmax(last));
+            if x == 0 {
+                break;
+            }
+            name = "{name}{vocab.decode(x)}";
+            context.push(x);
+            if context.len > block() {
+                context = slice(context, 1, block());
+            }
+        }
+        println("  {name}");
+    }
+}
+
+fun slice_f(xs: f64[], from: i64, n: i64): f64[] {
+    let mut out: f64[] = [];
+    for i in from..from + n {
+        out.push(xs[i]);
+    }
+    out
+}

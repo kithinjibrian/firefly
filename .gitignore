@@ -3,3 +3,6 @@
 /example/bigram
 /example/gradcheck
 /example/mlp
+/example/gpt
+/gpt
+/mlp
