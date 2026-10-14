@@ -1,12 +1,13 @@
 // A tiny GPT on names: token and position embeddings, one transformer
 // block (layernorm, causal multi-head self-attention, a GELU MLP, residual
 // connections), and a final layernorm and linear head, trained with AdamW
-// to predict the next character of a stream of names. Small (16 wide,
-// 2 heads, ~4k parameters) and strongly regularised, because the bundled
-// dataset is tiny; scale `width`, `heads` and the steps up with more data.
-// Run from the
+// to predict the next character of a stream of names. Run from the
 // repository root, optimised:
-//     lughac build -O2 example/gpt.la -o gpt && ./gpt
+//     lughac build -O2 example/gpt.la -o gpt
+//     ./gpt                                    # the small dataset, ~6 s
+//     ./gpt data/names-32k.txt 4000 32 4 0.1   # data, steps, width, heads, decay
+// The defaults (16 wide, 2 heads, decay 0.3) suit the tiny bundled data;
+// with makemore's 32k names a wider model can learn without memorising.
 import glowworm.array;
 import firefly.graph;
 import firefly.nn;
@@ -14,10 +15,8 @@ import firefly.random;
 import firefly.text;
 import std.math;
 
-// The context length, embedding width, and attention heads.
+// The context length.
 fun block(): i64 = 8;
-fun width(): i64 = 16;
-fun heads(): i64 = 2;
 
 // The parameters, as ids in the graph.
 struct Params {
@@ -27,7 +26,7 @@ struct Params {
     lnfg: i64, lnfb: i64, wlm: i64, blm: i64,
 }
 
-struct Gpt { g: graph.Graph, p: Params }
+struct Gpt { g: graph.Graph, p: Params, width: i64, heads: i64 }
 
 // A weight matrix with deviation 1/√fan-in, so activations keep their scale.
 fun weights(rng: random.Rng, rows: i64, cols: i64): (random.Rng, array.NdArray<f64>) {
@@ -36,10 +35,13 @@ fun weights(rng: random.Rng, rows: i64, cols: i64): (random.Rng, array.NdArray<f
     (r, w)
 }
 
-fun new_gpt(vocab: i64, seed: u64): Gpt {
+fun new_gpt(vocab: i64, width: i64, heads: i64, seed: u64): Gpt {
+    if width % heads != 0 {
+        panic("the width {width} must divide into {heads} heads");
+    }
     let mut rng = random.seeded(seed);
     let mut g = graph.new();
-    let (c, f) = (width(), 4 * width());
+    let (c, f) = (width, 4 * width);
     let ones: array.NdArray<f64> = array.ones([c]);
     let zeros: array.NdArray<f64> = array.zeros([c]);
     let wte = g.param(rng.normals([vocab, c], 0.5));
@@ -74,7 +76,7 @@ fun new_gpt(vocab: i64, seed: u64): Gpt {
         ln2g: ln2g, ln2b: ln2b, w1: w1, c1: c1, w2: w2, c2: c2,
         lnfg: lnfg, lnfb: lnfb, wlm: wlm, blm: blm,
     };
-    Gpt { g: g, p: p }
+    Gpt { g: g, p: p, width: width, heads: heads }
 }
 
 impl Gpt {
@@ -88,7 +90,7 @@ impl Gpt {
     // Scores over the vocabulary at each of `ids`' positions, each seeing
     // only itself and the positions before it.
     fun forward(mut self, ids: i64[]): i64 {
-        let p = self.p;
+        let (p, width, heads) = (self.p, self.width, self.heads);
         let t = ids.len;
         let mut positions: i64[] = [];
         for i in 0..t {
@@ -103,9 +105,9 @@ impl Gpt {
         let q = self.g.matmul(h, p.wq);
         let k = self.g.matmul(h, p.wk);
         let v = self.g.matmul(h, p.wv);
-        let size = width() / heads();
+        let size = width / heads;
         let mut out = -1;
-        for head in 0..heads() {
+        for head in 0..heads {
             let qh = self.g.cols(q, head * size, size);
             let kh = self.g.cols(k, head * size, size);
             let vh = self.g.cols(v, head * size, size);
@@ -133,12 +135,13 @@ impl Gpt {
         self.g.add_row(logits, p.blm)
     }
 
-    // The mean loss over every non-overlapping window of `stream`.
+    // The mean loss over the non-overlapping windows of `stream`, the first
+    // 400 at most so evaluation stays quick on large data.
     fun loss_on(mut self, stream: i64[]): f64 {
         let mut total = 0.0;
         let mut windows = 0;
         let mut i = 0;
-        while i + block() + 1 <= stream.len {
+        while i + block() + 1 <= stream.len && windows < 400 {
             self.g.reset();
             let logits = self.forward(slice(stream, i, block()));
             let loss = self.g.cross_entropy(logits, slice(stream, i + 1, block()));
@@ -189,9 +192,17 @@ fun bigram_loss(train: i64[], val: i64[], v: i64): f64 {
 }
 
 fun main() {
-    let raw = match read_file("data/names.txt") {
+    // `./gpt [data] [steps] [width] [heads] [decay]`
+    let a = args();
+    let arg = fun(i: i64, default: string): string = if a.len > i { a[i] } else { default };
+    let path = arg(1, "data/names.txt");
+    let steps = parse_i64(arg(2, "900")).expect("steps must be a whole number");
+    let width = parse_i64(arg(3, "16")).expect("width must be a whole number");
+    let heads = parse_i64(arg(4, "2")).expect("heads must be a whole number");
+    let decay = parse_f64(arg(5, "0.3")).expect("decay must be a number");
+    let raw = match read_file(path) {
         Ok(t) => t,
-        Err(e) => panic("can't read data/names.txt ({e}): run from the repository root"),
+        Err(e) => panic("can't read {path} ({e}): run from the repository root"),
     };
     let mut rng = random.seeded(1337);
     let names = rng.shuffle(raw.lines().filter(fun(l: string): bool = l.len > 0));
@@ -207,9 +218,12 @@ fun main() {
     let val = stream(val_names, vocab);
     println("{train.len} training tokens, {val.len} validation tokens, {v} token types");
 
-    let mut gpt = new_gpt(v, 7);
+    println("{width} wide, {heads} heads, {steps} steps, decay {decay}");
+    let mut gpt = new_gpt(v, width, heads, 7);
     let batch = 8;
-    for step in 0..901 {
+    let slow_down = steps * 7 / 9;
+    let report = math.max(steps / 6, 1);
+    for step in 0..steps + 1 {
         gpt.g.reset();
         let mut total = -1;
         for b in 0..batch {
@@ -220,8 +234,8 @@ fun main() {
         }
         let mean = gpt.g.scale(total, 1.0 / batch as f64);
         gpt.g.backward(mean);
-        gpt.g.adamw(if step < 700 { 0.005 } else { 0.0005 }, 0.3);
-        if step % 150 == 0 {
+        gpt.g.adamw(if step < slow_down { 0.005 } else { 0.0005 }, decay);
+        if step % report == 0 {
             println("step {step:>4}  batch loss {gpt.g.value(mean).data[0]:.4}");
         }
     }

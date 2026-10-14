@@ -4,7 +4,7 @@
 // AdamW (weight decay keeps it from memorising the small dataset) on
 // minibatches, and checked on names it never saw. Run from the repository
 // root, optimised:
-//     lughac build -O2 example/mlp.la -o mlp && ./mlp
+//     lughac build -O2 example/mlp.la -o mlp && ./mlp [data-file]
 import glowworm.array;
 import firefly.graph;
 import firefly.nn;
@@ -75,9 +75,11 @@ fun examples(names: string[], vocab: text.Vocab): (i64[], i64[]) {
 }
 
 fun main() {
-    let raw = match read_file("data/names.txt") {
+    let a = args();
+    let path = if a.len > 1 { a[1] } else { "data/names.txt" };
+    let raw = match read_file(path) {
         Ok(t) => t,
-        Err(e) => panic("can't read data/names.txt ({e}): run from the repository root"),
+        Err(e) => panic("can't read {path} ({e}): run from the repository root"),
     };
     let mut rng = random.seeded(42);
     let names = rng.shuffle(raw.lines().filter(fun(l: string): bool = l.len > 0));

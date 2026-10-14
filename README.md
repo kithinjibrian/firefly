@@ -8,6 +8,7 @@ lughac run example/gradcheck.la  # every op's gradient vs. a finite difference
 lughac run example/bigram.la     # a character bigram model of names, then samples
 lughac build -O2 example/mlp.la -o mlp && ./mlp   # an MLP language model (build with -O2: ~4× faster)
 lughac build -O2 example/gpt.la -o gpt && ./gpt   # a tiny GPT: causal self-attention, layernorm, GELU
+./gpt data/names-32k.txt 6000 32 4 0.1            # … on 32k names: data, steps, width, heads, decay
 ```
 
 ## How it works
@@ -52,7 +53,20 @@ for step in 0..1000 {
 
 Next: more data and more blocks, which mostly needs Lugha to stop copying arrays that ops only read (see Lugha's TODO).
 
-The bundled `data/names.txt` is small (229 names), so models overfit quickly; weight decay keeps the MLP honest. A larger names file (e.g. makemore's `names.txt`, 32k names) drops in as is.
+## Data and results
+
+- `data/names.txt`: 229 common names, for quick runs. Models overfit it quickly; weight decay keeps them honest.
+- `data/names-32k.txt`: makemore's `names.txt` (32,032 names, from [karpathy/makemore](https://github.com/karpathy/makemore), MIT licence). `./mlp` and `./gpt` take a data file as their first argument.
+
+On the 32k names, validation loss (lower is better):
+
+| Model | Validation loss | Time (-O2) |
+| --- | --- | --- |
+| bigram (counted) | 2.455 | — |
+| MLP, 3-char context (`./mlp data/names-32k.txt`, small-data settings) | 2.401 | 5 s |
+| GPT, 32 wide, 4 heads, 1 block, 6000 steps (`./gpt data/names-32k.txt 6000 32 4 0.1`) | **2.242** | 1 m 43 s |
+
+The GPT's training and validation losses match (2.241 vs 2.242): with 32k names it no longer memorises, so more width, more blocks and more steps would keep improving it. Samples: `kamori`, `mayzis`, `karie`, `adya`, `vayannata`.
 
 Speed: every graph op currently copies the arrays it reads (a Lugha limitation noted in its TODO), so training is a few times slower than the arithmetic alone would be. Build examples with `-O2`.
 
