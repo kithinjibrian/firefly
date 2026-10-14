@@ -1,0 +1,40 @@
+// A two-layer network learns XOR, the classic problem a single layer
+// can't solve: `lughac run example/xor.la`.
+import glowworm.array;
+import firefly.graph;
+import firefly.random;
+
+fun main() {
+    let xs = array.from([4, 2], [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+    let ys = array.from([4, 1], [0.0, 1.0, 1.0, 0.0]);
+
+    let mut rng = random.seeded(7);
+    let mut g = graph.new();
+    let w1 = g.param(rng.normals([2, 8], 1.0));
+    let b1 = g.param(array.zeros([8]));
+    let w2 = g.param(rng.normals([8, 1], 1.0));
+    let b2 = g.param(array.zeros([1]));
+
+    let mut out = 0;
+    for step in 0..2001 {
+        g.reset();
+        let x = g.input(xs);
+        let y = g.input(ys);
+        let z1 = g.matmul(x, w1);
+        let a1 = g.add_row(z1, b1);
+        let h = g.tanh(a1);
+        let z2 = g.matmul(h, w2);
+        let a2 = g.add_row(z2, b2);
+        out = g.sigmoid(a2);
+        let diff = g.sub(out, y);
+        let sq = g.mul(diff, diff);
+        let loss = g.mean(sq);
+        g.backward(loss);
+        g.sgd(1.0);
+        if step % 500 == 0 {
+            println("step {step:>4}  loss {g.value(loss).data[0]:.5}");
+        }
+    }
+    let shown = g.value(out).map(fun(p: f64): string = format("{:.3}", p));
+    println("predictions for 00, 01, 10, 11: {shown}");
+}

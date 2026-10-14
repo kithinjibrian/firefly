@@ -1,0 +1,58 @@
+// Checks every op's gradient against a finite difference: nudge each
+// parameter by ±h and compare the change in loss with `backward`'s answer.
+import glowworm.array;
+import firefly.graph;
+import firefly.random;
+import std.math;
+
+// `g` after a forward pass through every op, and the loss tensor.
+fun build(g: graph.Graph, x: array.NdArray<f64>): (graph.Graph, i64) {
+    let mut g = g;
+    g.reset();
+    let xi = g.input(x);
+    let z = g.matmul(xi, 0);
+    let a = g.add_row(z, 1);
+    let t = g.tanh(a);
+    let r = g.relu(a);
+    let s = g.sigmoid(t);
+    let m = g.mul(s, r);
+    let d = g.sub(m, t);
+    let e = g.add(d, s);
+    let total = g.sum(e);
+    let both = g.add(total, total);
+    let loss = g.mean(both);
+    (g, loss)
+}
+
+fun main() {
+    let mut rng = random.seeded(1);
+    let mut g = graph.new();
+    let w = g.param(rng.normals([3, 4], 1.0));
+    let b = g.param(rng.normals([4], 1.0));
+    let x = rng.normals([2, 3], 1.0);
+
+    let (built, loss) = build(g, x);
+    g = built;
+    g.backward(loss);
+    let h = 0.000001;
+    let mut worst = 0.0;
+    for p of [w, b] {
+        let analytic = g.grad(p);
+        for k in 0..analytic.data.len {
+            let mut up = g;
+            let mut v = up.value(p);
+            v.data[k] += h;
+            up.set_value(p, v);
+            let (u, lu) = build(up, x);
+            let mut down = g;
+            let mut v2 = down.value(p);
+            v2.data[k] -= h;
+            down.set_value(p, v2);
+            let (dn, ld) = build(down, x);
+            let numeric = (u.value(lu).data[0] - dn.value(ld).data[0]) / (2.0 * h);
+            worst = math.max(worst, math.abs(numeric - analytic.data[k]));
+        }
+    }
+    println("largest gradient error: {worst}");
+    println(if worst < 0.000001 { "gradients OK" } else { "gradients WRONG" });
+}

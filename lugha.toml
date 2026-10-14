@@ -1,0 +1,7 @@
+[package]
+name = "firefly"
+version = "0.1.0"
+source = "src"
+
+[packages]
+glowworm = { path = "../glowworm", version = "0.1" }

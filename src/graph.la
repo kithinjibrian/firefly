@@ -1,0 +1,243 @@
+// Reverse-mode automatic differentiation on a tape (`import firefly.graph;`).
+//
+// Lugha has no shared references, so instead of tensors that point at each
+// other, one `Graph` value holds every tensor: its value, its gradient and
+// the op that made it. A tensor is just its index (`i64`) in the graph.
+// Methods take `mut self`, so the graph changes in place, never copied.
+//
+//     let mut g = graph.new();
+//     let w = g.param(rng.normals([2, 1], 1.0));   // parameters first
+//     g.reset();                                     // each step
+//     let x = g.input(xs);
+//     let y = g.matmul(x, w);
+//     let loss = g.mean(y);
+//     g.backward(loss);
+//     g.sgd(0.1);
+import glowworm.array;
+import glowworm.linalg;
+import std.math;
+
+// How a tensor was made, naming the tensors it came from.
+enum Op {
+    Leaf,
+    Add(i64, i64),
+    Sub(i64, i64),
+    Mul(i64, i64),
+    MatMul(i64, i64),
+    AddRow(i64, i64),
+    Tanh(i64),
+    Relu(i64),
+    Sigmoid(i64),
+    Sum(i64),
+    Mean(i64),
+}
+
+public struct Graph {
+    values: array.NdArray<f64>[],
+    grads: array.NdArray<f64>[],
+    ops: Op[],
+    // The first `params` tensors are parameters, which `reset` keeps.
+    params: i64,
+}
+
+public fun new(): Graph = Graph { values: [], grads: [], ops: [], params: 0 };
+
+impl Graph {
+    // ---- Tensors -------------------------------------------------------
+
+    // A trainable parameter; add every parameter before anything else.
+    public fun param(mut self, value: array.NdArray<f64>): i64 {
+        if self.values.len != self.params {
+            panic("add parameters before any other tensor");
+        }
+        self.params += 1;
+        self.push(value, Op.Leaf)
+    }
+
+    // A constant input, such as a batch of data.
+    public fun input(mut self, value: array.NdArray<f64>): i64 = self.push(value, Op.Leaf);
+
+    // A tensor's value, and its gradient after `backward`.
+    public fun value(self, t: i64): array.NdArray<f64> = self.values[t];
+    public fun grad(self, t: i64): array.NdArray<f64> = self.grads[t];
+
+    // Replaces a tensor's value, e.g. to load trained weights; the shape
+    // must stay the same.
+    public fun set_value(mut self, t: i64, value: array.NdArray<f64>) {
+        if value.shape != self.values[t].shape {
+            panic("set_value can't change shape {self.values[t].shape} to {value.shape}");
+        }
+        self.values[t] = value;
+    }
+
+    // Drops everything but the parameters and zeroes their gradients:
+    // call at the start of every training step.
+    public fun reset(mut self) {
+        while self.values.len > self.params {
+            self.values.pop();
+            self.grads.pop();
+            self.ops.pop();
+        }
+        for i in 0..self.params {
+            self.grads[i] = array.zeros(self.values[i].shape);
+        }
+    }
+
+    fun push(mut self, value: array.NdArray<f64>, op: Op): i64 {
+        self.grads.push(array.zeros(value.shape));
+        self.values.push(value);
+        self.ops.push(op);
+        self.values.len - 1
+    }
+
+    // ---- Operations ----------------------------------------------------
+
+    // Element-wise, on equal shapes.
+    public fun add(mut self, a: i64, b: i64): i64 {
+        let v = self.values[a] + self.values[b];
+        self.push(v, Op.Add(a, b))
+    }
+
+    public fun sub(mut self, a: i64, b: i64): i64 {
+        let v = self.values[a] - self.values[b];
+        self.push(v, Op.Sub(a, b))
+    }
+
+    public fun mul(mut self, a: i64, b: i64): i64 {
+        let v = self.values[a] * self.values[b];
+        self.push(v, Op.Mul(a, b))
+    }
+
+    // (m × k) · (k × n).
+    public fun matmul(mut self, a: i64, b: i64): i64 {
+        let v = linalg.matmul(self.values[a], self.values[b]);
+        self.push(v, Op.MatMul(a, b))
+    }
+
+    // An (m × n) matrix plus an (n) row added to every row: a layer's bias.
+    public fun add_row(mut self, a: i64, row: i64): i64 {
+        let (m, r) = (self.values[a], self.values[row]);
+        if m.shape.len != 2 || r.shape != [m.shape[1]] {
+            panic("add_row needs (m × n) and (n), not {m.shape} and {r.shape}");
+        }
+        let n = m.shape[1];
+        let mut out = m;
+        for i in 0..out.data.len {
+            out.data[i] += r.data[i % n];
+        }
+        self.push(out, Op.AddRow(a, row))
+    }
+
+    public fun tanh(mut self, a: i64): i64 {
+        let v = self.values[a].map(fun(x: f64): f64 {
+            let e = math.exp(2.0 * x);
+            (e - 1.0) / (e + 1.0)
+        });
+        self.push(v, Op.Tanh(a))
+    }
+
+    public fun relu(mut self, a: i64): i64 {
+        let v = self.values[a].map(fun(x: f64): f64 = if x > 0.0 { x } else { 0.0 });
+        self.push(v, Op.Relu(a))
+    }
+
+    public fun sigmoid(mut self, a: i64): i64 {
+        let v = self.values[a].map(fun(x: f64): f64 = 1.0 / (1.0 + math.exp(-x)));
+        self.push(v, Op.Sigmoid(a))
+    }
+
+    // The sum or mean of every element, as a one-element tensor.
+    public fun sum(mut self, a: i64): i64 {
+        let v = array.from([1], [self.values[a].sum()]);
+        self.push(v, Op.Sum(a))
+    }
+
+    public fun mean(mut self, a: i64): i64 {
+        let v = array.from([1], [self.values[a].mean()]);
+        self.push(v, Op.Mean(a))
+    }
+
+    // ---- Learning ------------------------------------------------------
+
+    // Fills every gradient with d`loss`/d(tensor), `loss` being a
+    // one-element tensor. Gradients add up, so `reset` between steps.
+    public fun backward(mut self, loss: i64) {
+        self.grads[loss] = array.ones(self.values[loss].shape);
+        let mut i = loss;
+        while i >= 0 {
+            self.back(i);
+            i -= 1;
+        }
+    }
+
+    // Moves each parameter against its gradient: `p -= lr * grad`.
+    public fun sgd(mut self, lr: f64) {
+        for i in 0..self.params {
+            let step = self.grads[i].scale(lr);
+            self.values[i] = self.values[i] - step;
+        }
+    }
+
+    // Passes tensor `i`'s gradient back to the tensors it came from.
+    fun back(mut self, i: i64) {
+        let g = self.grads[i];
+        match self.ops[i] {
+            Leaf => {}
+            Add(a, b) => {
+                self.accumulate(a, g);
+                self.accumulate(b, g);
+            }
+            Sub(a, b) => {
+                self.accumulate(a, g);
+                self.accumulate(b, -g);
+            }
+            Mul(a, b) => {
+                let (va, vb) = (self.values[a], self.values[b]);
+                self.accumulate(a, g * vb);
+                self.accumulate(b, g * va);
+            }
+            MatMul(a, b) => {
+                let (va, vb) = (self.values[a], self.values[b]);
+                self.accumulate(a, linalg.matmul(g, vb.transpose()));
+                self.accumulate(b, linalg.matmul(va.transpose(), g));
+            }
+            AddRow(a, row) => {
+                self.accumulate(a, g);
+                let n = g.shape[1];
+                let mut sums: array.NdArray<f64> = array.zeros([n]);
+                for k in 0..g.data.len {
+                    sums.data[k % n] += g.data[k];
+                }
+                self.accumulate(row, sums);
+            }
+            Tanh(a) => {
+                let t = self.values[i];
+                let one: array.NdArray<f64> = array.ones(t.shape);
+                self.accumulate(a, g * (one - t * t));
+            }
+            Relu(a) => {
+                let mask = self.values[a].map(fun(x: f64): f64 = if x > 0.0 { 1.0 } else { 0.0 });
+                self.accumulate(a, g * mask);
+            }
+            Sigmoid(a) => {
+                let s = self.values[i];
+                let one: array.NdArray<f64> = array.ones(s.shape);
+                self.accumulate(a, g * s * (one - s));
+            }
+            Sum(a) => {
+                let shape = self.values[a].shape;
+                self.accumulate(a, array.full(shape, g.data[0]));
+            }
+            Mean(a) => {
+                let shape = self.values[a].shape;
+                let n = array.size(shape) as f64;
+                self.accumulate(a, array.full(shape, g.data[0] / n));
+            }
+        }
+    }
+
+    fun accumulate(mut self, t: i64, g: array.NdArray<f64>) {
+        let sum = self.grads[t] + g;
+        self.grads[t] = sum;
+    }
+}
