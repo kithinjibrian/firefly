@@ -63,11 +63,11 @@ On the 32k names, validation loss (lower is better):
 | Model | Validation loss | Time (-O2) |
 | --- | --- | --- |
 | bigram (counted) | 2.455 | — |
-| MLP, 3-char context (`./mlp data/names-32k.txt`, small-data settings) | 2.401 | 5 s |
-| GPT, 32 wide, 4 heads, 1 block, 6000 steps (`./gpt data/names-32k.txt 6000 32 4 0.1`) | **2.242** | 1 m 43 s |
+| MLP, 3-char context (`./mlp data/names-32k.txt`, small-data settings) | 2.401 | 4 s |
+| GPT, 32 wide, 4 heads, 1 block, 6000 steps (`./gpt data/names-32k.txt 6000 32 4 0.1`) | **2.242** | 1 m 30 s |
 
 The GPT's training and validation losses match (2.241 vs 2.242): with 32k names it no longer memorises, so more width, more blocks and more steps would keep improving it. Samples: `kamori`, `mayzis`, `karie`, `adya`, `vayannata`.
 
-Speed: every graph op currently copies the arrays it reads (a Lugha limitation noted in its TODO), so training is a few times slower than the arithmetic alone would be. Build examples with `-O2`.
+Speed: since Lugha's milestone 55 (copy-on-write arrays), reading an array out of the graph (`let g = self.grads[i];`) no longer copies it, which made training 13–35% faster with identical results. Build examples with `-O2`.
 
 firefly depends on glowworm through `lugha.toml` (`glowworm = { path = "../glowworm", version = "0.1" }`), so clone both side by side.
